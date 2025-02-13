@@ -1,0 +1,54 @@
+name: CI Pipeline - PR
+
+# Concurrency to cancel previous runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+# Limit permissions to minimum required
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write
+
+on:
+  pull_request:
+
+jobs:
+  build_on_pull_request:
+    name: Build & Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v4
+
+      - name: Common Build Steps
+        uses: ./.github/actions/build-steps
+        with:
+          NODE_ENV: ${{ github.ref_name == 'production' && 'production' || 'staging' }}
+
+      - name: Extract Version from package.json
+        if: github.base_ref == 'production'
+        shell: bash
+        id: extract-version
+        run: |
+          VERSION=$(jq -r '.version' package.json)
+          echo "Extracted version $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if version already exists
+        if: github.base_ref == 'production'
+        id: check-version
+        uses: actions/cache@v4
+        with:
+          path: CHANGELOG.md
+          key: v-${{ steps.extract-version.outputs.version }}
+
+      - name: Exit if version already exist
+        if: github.base_ref == 'production' && steps.check-version.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          echo "Version already exists. pls run npx changeset version"
+          exit 1

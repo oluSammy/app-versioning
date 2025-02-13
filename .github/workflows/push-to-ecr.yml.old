@@ -1,0 +1,110 @@
+name: Deploy To ElasticBeanstalk
+
+on:
+  push:
+    branches: [staging]
+  pull_request:
+    branches:
+      - staging
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v3
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Make envfile
+        uses: SpicyPizza/create-envfile@v2.0
+        with:
+          envkey_GHOST_BLOG_API_KEY: ${{ secrets.GHOST_BLOG_API_KEY }}
+          envkey_TEST_PROJECT_API_KEY: ${{ secrets.TEST_PROJECT_API_KEY }}
+          envkey_TEST_PROJECT_ID: ${{ secrets.TEST_PROJECT_ID }}
+          envkey_DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+          envkey_API_KEY: ${{ secrets.API_KEY }}
+          envkey_API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          file_name: .env
+          fail_on_empty: false
+          sort_keys: false
+
+      - name: build project
+        run: |
+          npm install -g yarn
+          yarn install --frozen-lockfile
+          yarn lint
+          yarn build
+
+      - name: Check branch name
+        id: branch-check
+        run: echo "##[set-output name=branch;]$(echo $GITHUB_REF | awk -F/ '{print $3}')"
+
+      -
+        name: Set up QEMU
+        if: steps.branch-check.outputs.branch == 'staging'
+        uses: docker/setup-qemu-action@v3
+
+      -
+        name: Set up Docker Buildx
+        if: steps.branch-check.outputs.branch == 'staging'
+        uses: docker/setup-buildx-action@v3
+
+      -
+        name: Configure AWS credentials
+        if: steps.branch-check.outputs.branch == 'staging'
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      -
+        name: Login to Amazon ECR
+        if: steps.branch-check.outputs.branch == 'staging'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and push the docker image
+        if: steps.branch-check.outputs.branch == 'staging'
+        run: |
+          ls -l $GITHUB_WORKSPACE/.next
+          cp -r $GITHUB_WORKSPACE/public $GITHUB_WORKSPACE/.next
+          docker build $GITHUB_WORKSPACE/.next --file Dockerfile.blueprint --platform=linux/arm64 --tag 953486003362.dkr.ecr.eu-central-1.amazonaws.com/nftvaluations-app:latest
+          docker push 953486003362.dkr.ecr.eu-central-1.amazonaws.com/nftvaluations-app:latest
+
+      - name: Generate Deployment Package
+        if: steps.branch-check.outputs.branch == 'staging'
+        run: |
+          zip -r deploy.zip . -x '*node_modules*'
+
+      - name: Get timestamp
+        if: steps.branch-check.outputs.branch == 'staging'
+        uses: gerred/actions/current-time@master
+        id: current-time
+
+      - name: Run string replace
+        if: steps.branch-check.outputs.branch == 'staging'
+        uses: frabert/replace-string-action@master
+        id: format-time
+        with:
+          pattern: '[:\.]+'
+          string: '${{ steps.current-time.outputs.time }}'
+          replace-with: '-'
+          flags: 'g'
+
+      - name: Deploy to EB
+        if: steps.branch-check.outputs.branch == 'staging'
+        uses: einaregilsson/beanstalk-deploy@v21
+        with:
+          aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          application_name: nftvaluations-app-staging-application
+          environment_name: nftvaluations-app-staging
+          version_label: 'nftvaluations-app-staging-${{ steps.format-time.outputs.replaced }}'
+          region: eu-central-1
+          deployment_package: deploy.zip
+          wait_for_deployment: false

@@ -1,0 +1,43 @@
+name: "Common Build Steps"
+description: "Common steps for building the project"
+inputs:
+  NODE_ENV:
+    description: "Node environment"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: "yarn"
+
+    - name: Check dependencies cache
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: node_modules
+        key: deps-node-modules-${{ hashFiles('**/yarn.lock') }}
+        restore-keys: |
+          deps-node-modules-
+
+    - name: Install dependencies
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: yarn install --frozen-lockfile --legacy-peer-deps
+
+    - name: Make .env file
+      uses: SpicyPizza/create-envfile@v2.0
+      with:
+        envkey_NODE_ENV: ${{ inputs.NODE_ENV }}
+        file_name: .env
+        fail_on_empty: false
+        sort_keys: false
+
+    - name: Run build
+      shell: bash
+      run: |
+        yarn add sharp --ignore-platform --legacy-peer-deps
+        yarn build

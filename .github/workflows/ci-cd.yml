@@ -1,0 +1,121 @@
+name: CI/CD Pipeline
+
+# Cancel previous runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+# Limit permissions to minimum required
+permissions:
+  contents: read
+  packages: read # For ECR access
+  actions: write # For cache operations
+  id-token: write # Required for AWS credential provider
+
+on:
+  push:
+    branches:
+      - production
+      - staging
+
+jobs:
+  build_on_push:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ github.ref_name == 'production' && 'Production' || 'Staging' }}
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v4
+
+      - name: Common Build Steps
+        uses: ./.github/actions/build-steps
+        with:
+          NODE_ENV: ${{ github.ref_name == 'production' && 'production' || 'staging' }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+
+      - name: Get Version from package.json
+        if: github.ref_name == 'production'
+        shell: bash
+        id: extract-version
+        run: |
+          VERSION=$(jq -r '.version' package.json)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and push the docker image
+        run: |
+          ls -l $GITHUB_WORKSPACE/.next
+          cp -r $GITHUB_WORKSPACE/public $GITHUB_WORKSPACE/.next
+          cp -r $GITHUB_WORKSPACE/scripts/dist $GITHUB_WORKSPACE/.next
+          docker build $GITHUB_WORKSPACE/.next --file Dockerfile.blueprint --platform=linux/arm64 --tag 953486003362.dkr.ecr.eu-central-1.amazonaws.com/nftvaluations-app:latest
+          docker push 953486003362.dkr.ecr.eu-central-1.amazonaws.com/nftvaluations-app:latest
+
+      - name: Generate Deployment Package
+        run: zip -r deploy.zip docker-compose.yml .ebextensions .env
+
+      - name: Get timestamp
+        uses: gerred/actions/current-time@master
+        id: current-time
+
+      - name: Run string replace
+        uses: frabert/replace-string-action@master
+        id: format-time
+        with:
+          pattern: '[:\.]+'
+          string: "${{ steps.current-time.outputs.time }}"
+          replace-with: "-"
+          flags: "g"
+
+      - name: Set EB version
+        id: eb-version
+        run: |
+          echo "EB Version: ${{ steps.extract-version.outputs.version }}"
+          if [ "${{ github.ref_name }}" == "production" ]; then
+            echo "version=${{ steps.extract-version.outputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ steps.format-time.outputs.replaced }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy to EB
+        uses: einaregilsson/beanstalk-deploy@v21
+        with:
+          aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          application_name: ${{ vars.BEANSTALK_APPLICATION_NAME }}
+          environment_name: ${{ vars.BEANSTALK_ENVIRONMENT_NAME }}
+          version_label: "${{ vars.BEANSTALK_ENVIRONMENT_NAME }}-v-${{ steps.eb-version.outputs.version }}"
+          region: ${{ vars.AWS_REGION }}
+          deployment_package: deploy.zip
+          use_existing_version_if_available: true
+          wait_for_deployment: true
+
+      - name: Save version
+        if: github.ref_name == 'production'
+        uses: actions/cache/save@v4
+        with:
+          path: CHANGELOG.md
+          key: v-${{ steps.extract-version.outputs.version }}
+
+      - name: Send Discord notification
+        if: github.ref_name == 'production'
+        run: |
+          npm run version-alert
+        env:
+          VERSION: v-${{ steps.eb-version.outputs.version }}
